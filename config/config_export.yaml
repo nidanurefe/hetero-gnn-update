@@ -1,0 +1,19 @@
+# Export configuration for full-graph node embeddings
+data:
+  proc_dir: "data/processed"
+  graph_path: "data/processed/hetero_graph.pt"  # cross-domain graph
+  # graph_path: "data/processed/hetero_graph_target_only.pt"  # target-only graph
+
+model:
+  name: "sage"                                  # "gat" | "sage"
+  ckpt_path: "data/processed/models/sage.pt"
+  hidden: 64                                    # should match training (or will be inferred for SAGE/GAT embeddings)
+  heads: 2                                      # for GAT only
+
+export:
+  out_dir: "data/processed/embeddings"
+  outfile: "sage_embeddings.pt"
+  device: "cpu"
+  use_checkpoint_sizes: 0
+
+

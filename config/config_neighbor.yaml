@@ -1,0 +1,22 @@
+
+# Training configuration for neighbor sampling
+training:
+  graph_path: data/processed/hetero_graph.pt
+  save_path: data/processed/models
+  epochs: 20
+  batch_size: 2048
+  lr: 0.001
+  weight_decay: 0.00001
+  num_neighbors: [80, 40] 
+  neg_ratio: 4.0  # negatives per positive
+
+# Model configuration
+model:
+  hidden: 32
+  heads: 2
+
+# Loss configuration
+loss:
+  use_books_loss: 1  # 1: use both domains, 0: movie-only
+  lambda_book: 0.3
+
