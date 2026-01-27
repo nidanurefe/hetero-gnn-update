@@ -14,12 +14,10 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 
 def recall_at_k(ranks: List[int], k: int) -> float:
-    # ranks: 1-based rank positions of true positives in the ranked list
     return float(np.mean([1.0 if r <= k else 0.0 for r in ranks])) if ranks else 0.0
 
 
 def ndcg_at_k(ranks: List[int], k: int) -> float:
-    # DCG with multiple positives (if test has multiple items)
     dcg = sum(1.0 / np.log2(r + 1) for r in ranks if r <= k)
     ideal = sum(1.0 / np.log2(i + 2) for i in range(min(len(ranks), k)))
     return float(dcg / ideal) if ideal > 0 else 0.0
@@ -41,6 +39,19 @@ def load_config(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def normalize_model_name(model_name: str) -> str:
+
+    name = model_name.strip().lower()
+    if "gat" in name:
+        return "gat"
+    if "sage" in name:
+        return "sage"
+    # If exact match, return as is
+    if name in ["gat", "sage"]:
+        return name
+    raise ValueError(f"Unknown model name '{model_name}'. Must contain 'gat' or 'sage'")
+
+
 def load_model_class(model_name: str):
     name = model_name.strip().lower()
     if name == "gat":
@@ -56,6 +67,7 @@ def load_model_class(model_name: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/config_eval.yaml")
+    parser.add_argument("--model", type=str, default=None, help="Model name: 'gat' or 'sage' (overrides config)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -63,8 +75,18 @@ def main():
     proc_dir = Path(cfg["data"]["proc_dir"])
     graph_path = Path(cfg["data"]["graph_path"])
 
-    model_name = cfg["model"]["name"]
-    ckpt_path = Path(cfg["model"]["ckpt_path"])
+    # Use command line argument if provided, otherwise use config
+    model_name_cli = args.model if args.model is not None else cfg["model"]["name"]
+    # Normalize model name: CLI can accept any name, but internally we use 'gat' or 'sage'
+    model_name = normalize_model_name(model_name_cli)
+    
+    # If model name provided via CLI, construct checkpoint path from it
+    # Otherwise use the path from config
+    if args.model is not None:
+        # Construct path: data/processed/models/{model_name_cli}.pt
+        ckpt_path = proc_dir / "models" / f"{model_name_cli}.pt"
+    else:
+        ckpt_path = Path(cfg["model"]["ckpt_path"])
     hidden = int(cfg["model"].get("hidden", 32))
     heads = int(cfg["model"].get("heads", 2))
 
@@ -86,7 +108,7 @@ def main():
     num_movies = mp["num_movies"]
 
     # instantiate model
-    logger.info(f"Loading model class: {model_name}")
+    logger.info(f"Loading model class: {model_name} (from CLI: {model_name_cli})")
     ModelCls = load_model_class(model_name)
 
     # GAT signature: (num_users, num_books, num_movies, hidden=, heads=)
@@ -131,6 +153,10 @@ def main():
         if not pos_items:
             continue
 
+        # Select exactly 1 positive item randomly from test set
+        pos_item = int(rng.choice(pos_items))
+        pos_items = [pos_item]
+
         # sample negatives
         negs = []
         while len(negs) < num_neg:
@@ -138,7 +164,7 @@ def main():
             if cand not in seen.get(int(u), set()):
                 negs.append(cand)
 
-        candidates = list(map(int, pos_items)) + negs
+        candidates = pos_items + negs
 
         # dot product score
         scores = (ZM[candidates] * ZU[int(u)]).sum(dim=1)

@@ -6,13 +6,13 @@ data:
 
 model:
   name: "sage"                                  # "gat" | "sage"
-  ckpt_path: "data/processed/models/sage.pt"
-  hidden: 64                                    # should match training (or will be inferred for SAGE/GAT embeddings)
+  ckpt_path: "/Users/nidac/Desktop/hetero-gnn-update/1-shot-update/models/sage-wbce-100ep-4neg-up.pt"
+  hidden: 32                                    # should match training (or will be inferred for SAGE/GAT embeddings)
   heads: 2                                      # for GAT only
 
 export:
   out_dir: "data/processed/embeddings"
-  outfile: "sage_embeddings.pt"
+  outfile: "sage-wbce-100ep-4neg-1shot.pt"
   device: "cpu"
   use_checkpoint_sizes: 0
 

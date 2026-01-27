@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
+import matplotlib.pyplot as plt
 import yaml
 import pandas as pd
 import torch
@@ -36,6 +37,11 @@ class HeteroSAGE(nn.Module):
         self.user_emb  = nn.Embedding(num_users, hidden)
         self.book_emb  = nn.Embedding(num_books, hidden)
         self.movie_emb = nn.Embedding(num_movies, hidden)
+        
+        # Initialize embeddings with Xavier uniform
+        nn.init.xavier_uniform_(self.user_emb.weight)
+        nn.init.xavier_uniform_(self.book_emb.weight)
+        nn.init.xavier_uniform_(self.movie_emb.weight)
 
         # Layer 1
         convs1 = {
@@ -76,7 +82,7 @@ class HeteroSAGE(nn.Module):
 
         # conv stack as usual
         x = self.conv1(x, batch.edge_index_dict)
-        x = {k: F.relu(self.lin[k](v)) for k, v in x.items()}
+        x = {k: F.relu(v) for k, v in x.items()}
 
         x = self.conv2(x, batch.edge_index_dict)
         x = {k: F.relu(self.lin[k](v)) for k, v in x.items()}
@@ -94,6 +100,14 @@ def link_bce_loss(
     dst = edge_label_index[1]
     scores = (z_user[src] * z_item[dst]).sum(dim=-1)  # dot product
     return F.binary_cross_entropy_with_logits(scores, edge_label.float())
+
+def weighted_bce_loss(z_user, z_item, edge_label_index, edge_label, pos_weight: float):
+    src = edge_label_index[0]
+    dst = edge_label_index[1]
+    scores = (z_user[src] * z_item[dst]).sum(dim=-1)
+    
+    pw = torch.tensor([pos_weight], device=scores.device, dtype=scores.dtype)
+    return F.binary_cross_entropy_with_logits(scores, edge_label.float(), pos_weight=pw)
 
 
 # DataLoader (neighbor sampling)
@@ -212,6 +226,17 @@ def main():
         f"Config: epochs={epochs}, batch_size={batch_size}, num_neighbors={num_neighbors}, "
         f"neg_ratio={neg_ratio}, use_books={int(use_books)}, lambda_book={lambda_book}, hidden={hidden}"
     )
+    
+    data = data.to(device)
+    
+    # Calculate pos_weight for weighted BCE
+    pos_weight = neg_ratio + 1.0  # total_samples / positive_samples
+    logger.info(f"Using pos_weight={pos_weight:.2f} for weighted BCE loss")
+    
+    # Loss tracking for plotting
+    epoch_losses = []
+    epoch_movie_losses = []
+    epoch_book_losses = []
 
     for ep in range(1, epochs + 1):
         model.train()
@@ -224,7 +249,7 @@ def main():
 
             m_ei = mbatch[MOVIE_REL].edge_label_index
             m_y  = mbatch[MOVIE_REL].edge_label
-            loss_movie = link_bce_loss(z["user"], z["movie"], m_ei, m_y)
+            loss_movie = weighted_bce_loss(z["user"], z["movie"], m_ei, m_y, pos_weight)
 
             loss = loss_movie
 
@@ -240,7 +265,7 @@ def main():
 
                 b_ei = bbatch[BOOK_REL].edge_label_index
                 b_y  = bbatch[BOOK_REL].edge_label
-                loss_book = link_bce_loss(bz["user"], bz["book"], b_ei, b_y)
+                loss_book = weighted_bce_loss(bz["user"], bz["book"], b_ei, b_y, pos_weight)
 
                 loss = loss + lambda_book * loss_book
             else:
@@ -255,14 +280,50 @@ def main():
             total_book += float(loss_book.item())
             n_steps += 1
 
+        # Logging
+        avg_loss = total/max(n_steps,1)
+        avg_movie_loss = total_movie/max(n_steps,1)
+        avg_book_loss = total_book/max(n_steps,1)
+        
+        epoch_losses.append(avg_loss)
+        epoch_movie_losses.append(avg_movie_loss)
+        epoch_book_losses.append(avg_book_loss)
+        
+        log_parts = [f"[Epoch {ep:03d}] loss={avg_loss:.4f}"]
         if use_books:
-            logger.info(f"[Epoch {ep:03d}] loss={total/max(n_steps,1):.4f} | movie={total_movie/max(n_steps,1):.4f} | book={total_book/max(n_steps,1):.4f}")
+            log_parts.append(f"movie={avg_movie_loss:.4f}")
+            log_parts.append(f"book={avg_book_loss:.4f}")
         else:
-            logger.info(f"[Epoch {ep:03d}] loss={total/max(n_steps,1):.4f} | movie={total_movie/max(n_steps,1):.4f}")
+            log_parts.append(f"movie={avg_movie_loss:.4f}")
+        logger.info(" | ".join(log_parts))
+
+    # Plot training loss curves
+    logger.info("Creating loss plot...")
+    plt.figure(figsize=(10, 6))
+    
+    epochs_range = range(1, epochs + 1)
+    plt.plot(epochs_range, epoch_losses, 'b-', label='Total Loss', linewidth=2)
+    plt.plot(epochs_range, epoch_movie_losses, 'r--', label='Movie Loss', linewidth=1.5)
+    
+    if use_books:
+        plt.plot(epochs_range, epoch_book_losses, 'g--', label='Book Loss', linewidth=1.5)
+    
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('SAGE Training Loss Over Epochs', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Save plot
+    plot_path = save_path.replace('.pt', '_loss_plot.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    logger.info(f"Loss plot saved to: {plot_path}")
+    plt.close()
 
     logger.info(f"Saving model to: {save_path}")
     torch.save(model.state_dict(), save_path)
-    logger.info("Saved")
+    logger.info("✓ Saved")
 
 
 if __name__ == "__main__":

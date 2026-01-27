@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import pandas as pd
+import numpy as np
 
 from logging_config import get_logger
 
@@ -24,24 +25,16 @@ def read_inter(path: Path) -> pd.DataFrame:
     return df
 
 
-# Will be used later
-def read_item(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, sep="\t", header=None, skiprows=1, low_memory=False,
-                     names=["item_id","categories","title","price","sales_type","sales_rank","brand"])
-    df["item_id"] = df["item_id"].astype(str)
-    return df
-
-
 def filter_overlap_users(
     books: pd.DataFrame,
     movies: pd.DataFrame,
     min_user_interactions: int = 5,
     min_item_interactions: int = 5,
 ):
-    # Find overlap users (users in both domains)
-    ub = books["user_id"].value_counts()  # user interaction counts in books
-    um = movies["user_id"].value_counts()  # user interaction counts in movies
-    overlap = ub.index.intersection(um.index)  # users in both domains
+    # Find overlap users 
+    ub = books["user_id"].value_counts()
+    um = movies["user_id"].value_counts()
+    overlap = ub.index.intersection(um.index)
     
     logger.info(f"Step 1 - Overlap users found: {len(overlap):,}")
 
@@ -67,8 +60,8 @@ def filter_overlap_users(
 
     # Item filtering (min interactions per item)
     logger.info("Step 4 - Filtering items with minimum interactions...")
-    book_counts = books_f["item_id"].value_counts()  # book interaction counts in filtered books
-    movie_counts = movies_f["item_id"].value_counts()  # movie interaction counts in filtered movies
+    book_counts = books_f["item_id"].value_counts()
+    movie_counts = movies_f["item_id"].value_counts()
     
     num_books_before = books_f["item_id"].nunique()
     num_movies_before = movies_f["item_id"].nunique()
@@ -91,7 +84,6 @@ def filter_overlap_users(
     logger.info(f"  After item filtering - Movies edges: {len(movies_f):,} (removed {movies_f_before - len(movies_f):,})")
     logger.info(f"  After item filtering - Books items: {books_f['item_id'].nunique():,}, Movies items: {movies_f['item_id'].nunique():,}")
 
-
     final_users = books_f['user_id'].nunique()
     logger.info("=" * 60)
     logger.info(f"Step 5 - FINAL RESULTS:")
@@ -104,128 +96,95 @@ def filter_overlap_users(
     return books_f, movies_f
 
 
-
-def cold_start_split_per_user(movies: pd.DataFrame, k_shot_train: int = 1):
-    movies = movies.sort_values(["user_id", "timestamp"]).copy() # sort by user and timestamp (oldest first)
-    # For k_shot_train=1: Keep oldest interaction in train
-    # Remaining movies -> val/test split
-
-    train_parts, val_parts, test_parts = [], [], [] # lists to hold split parts
-
-    # each user and its interactions
+def random_percent_split_per_user(movies: pd.DataFrame, train_percent: float = 0.1, seed: int = 42):
+    np.random.seed(seed)
+    
+    movies = movies.copy()
+    train_parts, val_parts, test_parts = [], [], []
+    
+    stats_train_counts = []  # Track train counts per user for logging
+    
     for u, g in movies.groupby("user_id", sort=False):
-        if k_shot_train == 0:
-            rest = g  # all interactions go to val/test
-        else:
-            # k_shot > 0: take first k interactions for train, rest for val/test
-            g_train = g.iloc[:k_shot_train] # first k interactions (oldest) for train
-            rest = g.iloc[k_shot_train:] # remaining interactions for val/test
-            train_parts.append(g_train)
-
-        # split rest into val/test
-        mid = len(rest) // 2
-
+        n_total = len(g)
+        n_train = max(1, int(n_total * train_percent))  # at least 1 for train
+        
+        # Randomly select indices for train
+        indices = np.arange(n_total)
+        np.random.shuffle(indices)
+        
+        train_idx = indices[:n_train]
+        rest_idx = indices[n_train:]
+        
+        g_train = g.iloc[train_idx]
+        rest = g.iloc[rest_idx]
+        
+        train_parts.append(g_train)
+        stats_train_counts.append(n_train)
+        
+        # Split rest into val/test
+        n_rest = len(rest)
+        if n_rest == 0:
+            continue
+        
+        mid = n_rest // 2
         if mid == 0:
-            # if only 1 left, put it into test
+            # Only 1 left, put in test
             g_val = rest.iloc[:0]
             g_test = rest
         else:
             g_val = rest.iloc[:mid]
             g_test = rest.iloc[mid:]
-
+        
         if len(g_val) > 0:
             val_parts.append(g_val)
-        test_parts.append(g_test)
-
-    # Sanity checks: ensure we have data after split
-    if k_shot_train == 0:
-        if not test_parts:
-            raise RuntimeError("Cold-start split produced empty test. Check data - no users with interactions?")
-    else:
-        if not train_parts:
-            raise RuntimeError(f"Cold-start split produced empty train. Check k_shot_train={k_shot_train} and data.")
-        if not test_parts:
-            raise RuntimeError("Cold-start split produced empty test. Check data - users may have too few interactions.")
-
+        if len(g_test) > 0:
+            test_parts.append(g_test)
+    
     train_df = pd.concat(train_parts, ignore_index=True) if train_parts else movies.iloc[:0].copy()
     val_df = pd.concat(val_parts, ignore_index=True) if val_parts else movies.iloc[:0].copy()
-    test_df = pd.concat(test_parts, ignore_index=True)
-
+    test_df = pd.concat(test_parts, ignore_index=True) if test_parts else movies.iloc[:0].copy()
+    
+    # Log statistics
+    logger.info(f"Random split statistics (train_percent={train_percent:.1%}):")
+    logger.info(f"  Train interactions per user - min: {min(stats_train_counts)}, max: {max(stats_train_counts)}, mean: {np.mean(stats_train_counts):.2f}")
+    logger.info(f"  Total splits - Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+    
     return train_df, val_df, test_df
 
 
 def make_id_maps(books_inter: pd.DataFrame, movies_inter: pd.DataFrame):
     # global user mapping 
     users = pd.Index(sorted(set(books_inter["user_id"]).union(movies_inter["user_id"])))
-    user2id = {u:i for i,u in enumerate(users)}
+    user2id = {u: i for i, u in enumerate(users)}
 
     # domain-specific item mapping
-    book_items  = pd.Index(sorted(books_inter["item_id"].unique()))
+    book_items = pd.Index(sorted(books_inter["item_id"].unique()))
     movie_items = pd.Index(sorted(movies_inter["item_id"].unique()))
-    book2id  = {it:i for i,it in enumerate(book_items)}
-    movie2id = {it:i for i,it in enumerate(movie_items)}
+    book2id = {it: i for i, it in enumerate(book_items)}
+    movie2id = {it: i for i, it in enumerate(movie_items)}
 
     return user2id, book2id, movie2id
 
-# Apply ID mappings to dataframe
+
 def apply_maps(df: pd.DataFrame, user2id: dict, item2id: dict, item_col="item_id"):
+    """Apply ID mappings to dataframe."""
     out = df.copy()
     out["uid"] = out["user_id"].map(user2id).astype(int)
     out["iid"] = out[item_col].map(item2id).astype(int)
     return out
 
 
-def sanity_checks():
-    tr = pd.read_parquet(OUT/"movies_train.parquet")
-    va = pd.read_parquet(OUT/"movies_val.parquet")
-    te = pd.read_parquet(OUT/"movies_test.parquet")
-
-    # 1-shot check
-    per_user = tr.groupby("uid").size()
-    logger.info(f"[check] movies_train interactions per user: min={per_user.min()}, max={per_user.max()}, mean={per_user.mean():.3f}")
-
-    # train-test edge overlap check
-    tr_edges = set(zip(tr["uid"].tolist(), tr["iid"].tolist()))
-    te_edges = set(zip(te["uid"].tolist(), te["iid"].tolist()))
-    overlap = tr_edges & te_edges
-    logger.info(f"[check] train-test edge overlap: {len(overlap)} (should be 0)")
-
-    # test users in train check
-    missing_users = set(te["uid"].unique()) - set(tr["uid"].unique())
-    logger.info(f"[check] test users missing in train: {len(missing_users)} (should be 0)")
-
-
-def calculate_sparsity(df_books, df_movies, num_users, num_books, num_movies):
-    n_interactions = len(df_books) + len(df_movies)
-    
-    total_possible = (num_users * num_books) + (num_users * num_movies)
-    
-    sparsity = 1.0 - (n_interactions / total_possible)
-    density = (n_interactions / total_possible) * 100
-    
-    logger.info("=== Data Sparsity Statistics ===")
-    logger.info(f"Total Users: {num_users}")
-    logger.info(f"Total Items: {num_books + num_movies} (Books: {num_books}, Movies: {num_movies})")
-    logger.info(f"Total Interactions: {n_interactions}")
-    logger.info(f"Sparsity: {sparsity:.6f} ({sparsity*100:.4f}%)")
-    logger.info(f"Density:  {density:.6f}%")
-    
-    avg_book = len(df_books) / num_users
-    avg_movie = len(df_movies) / num_users
-    logger.info(f"Avg Books per User: {avg_book:.2f}")
-    logger.info(f"Avg Movies per User: {avg_movie:.2f}")
-
-
-
 def main():
-    logger.info("Starting preprocessing...")
+    logger.info("=" * 80)
+    logger.info("Starting preprocessing with RANDOM 10% TARGET DOMAIN SPLIT")
+    logger.info("=" * 80)
     logger.info("Reading interaction data...")
 
     books_inter = read_inter(RAW / "AmazonBooks/AmazonBooks.inter")
-    logger.info(f"Books interactions: {len(books_inter)} records")
+    logger.info(f"Books interactions: {len(books_inter):,} records")
 
     movies_inter = read_inter(RAW / "AmazonMov/AmazonMov.inter")
-    logger.info(f"Movies interactions: {len(movies_inter)} records")
+    logger.info(f"Movies interactions: {len(movies_inter):,} records")
 
     # Log initial user counts (before any filtering)
     num_books_users = books_inter["user_id"].nunique()
@@ -246,56 +205,62 @@ def main():
         min_item_interactions=5
     )
     logger.info(
-        f"After overlap filtering - users: {books_f['user_id'].nunique()}, "
-        f"books edges: {len(books_f)}, movies edges: {len(movies_f)}"
+        f"After overlap filtering - users: {books_f['user_id'].nunique():,}, "
+        f"books edges: {len(books_f):,}, movies edges: {len(movies_f):,}"
     )
-    k_shot_train = 0 
-    logger.info(f"Cold-start splitting TARGET domain (movies) with k_shot_train={k_shot_train}...")
-    logger.info(f"SOURCE domain (books): All {len(books_f)} filtered interactions will go to train")
-    m_train, m_val, m_test = cold_start_split_per_user(movies_f, k_shot_train=k_shot_train)
-
-    # All overlap users that passed filtering will be used regardless of k_shot
+    train_percent = 0.10  # 10% of each user's interactions go to train
+    logger.info("=" * 60)
+    logger.info(f"SPLIT STRATEGY:")
+    logger.info(f"  SOURCE domain (books): ALL {len(books_f):,} filtered interactions → TRAIN")
+    logger.info(f"  TARGET domain (movies): RANDOM {train_percent:.0%} per user → TRAIN, rest → VAL/TEST")
+    logger.info("=" * 60)
+    
+    m_train, m_val, m_test = random_percent_split_per_user(movies_f, train_percent=train_percent, seed=42)
     
     logger.info(
-        f"Overlap users: {books_f['user_id'].nunique()} | "
-        f"Books edges: {len(books_f)} | Movies edges (all): {len(movies_f)} | "
-        f"Movies split sizes: train={len(m_train)}, val={len(m_val)}, test={len(m_test)}"
+        f"Final overlap users: {books_f['user_id'].nunique():,} | "
+        f"Books edges (all in train): {len(books_f):,} | "
+        f"Movies split - Train: {len(m_train):,}, Val: {len(m_val):,}, Test: {len(m_test):,}"
     )
 
     # create ID mappings from filtered data
     logger.info("Creating ID mappings...")
     user2id, book2id, movie2id = make_id_maps(books_f, movies_f)
-    logger.info(f"Users: {len(user2id)}, Books: {len(book2id)}, Movies: {len(movie2id)}")
+    logger.info(f"Users: {len(user2id):,}, Books: {len(book2id):,}, Movies: {len(movie2id):,}")
 
     # apply mappings
     logger.info("Applying ID mappings...")
-
-    books_train  = apply_maps(books_f, user2id, book2id)
+    books_train = apply_maps(books_f, user2id, book2id)
     movies_train = apply_maps(m_train, user2id, movie2id)
-    movies_val   = apply_maps(m_val, user2id, movie2id)
-    movies_test  = apply_maps(m_test, user2id, movie2id)
+    movies_val = apply_maps(m_val, user2id, movie2id)
+    movies_test = apply_maps(m_test, user2id, movie2id)
 
     # sanity checks
-    logger.info("[check] Verifying cold-start + leakage...")
+    logger.info("=" * 60)
+    logger.info("SANITY CHECKS:")
     if len(movies_train) > 0:
         per_user = movies_train.groupby("uid").size()
         logger.info(
-            f"[check] movies_train per-user: min={per_user.min()}, "
-            f"max={per_user.max()}, mean={per_user.mean():.3f}"
+            f"  [✓] Movies train per-user stats: "
+            f"min={per_user.min()}, max={per_user.max()}, mean={per_user.mean():.2f}"
         )
     else:
-        logger.info("[check] movies_train is empty (k_shot_train=0)")
+        logger.warning("  [!] movies_train is empty!")
 
     tr_edges = set(zip(movies_train["uid"].tolist(), movies_train["iid"].tolist())) if len(movies_train) > 0 else set()
     te_edges = set(zip(movies_test["uid"].tolist(), movies_test["iid"].tolist()))
-    logger.info(f"[check] train-test edge overlap: {len(tr_edges & te_edges)} (should be 0)")
-
-    if k_shot_train == 0:
-        # k_shot=0: train is empty, so all test users are "missing" from train (this is expected)
-        logger.info(f"[check] k_shot_train=0: train is empty, {len(movies_test['uid'].unique())} test users (expected)")
+    overlap_edges = len(tr_edges & te_edges)
+    if overlap_edges == 0:
+        logger.info(f"  [✓] Train-test edge overlap: {overlap_edges} (GOOD)")
     else:
-        missing_users = set(movies_test["uid"].unique()) - set(movies_train["uid"].unique())
-        logger.info(f"[check] test users missing in train: {len(missing_users)} (should be 0)")
+        logger.warning(f"  [!] Train-test edge overlap: {overlap_edges} (SHOULD BE 0!)")
+
+    missing_users = set(movies_test["uid"].unique()) - set(movies_train["uid"].unique())
+    if len(missing_users) == 0:
+        logger.info(f"  [✓] Test users missing in train: {len(missing_users)} (GOOD)")
+    else:
+        logger.warning(f"  [!] Test users missing in train: {len(missing_users)} (SHOULD BE 0!)")
+    logger.info("=" * 60)
 
     # save parquet + mappings
     logger.info("Saving parquet files...")
@@ -303,6 +268,7 @@ def main():
     movies_train.to_parquet(OUT / "movies_train.parquet", index=False)
     movies_val.to_parquet(OUT / "movies_val.parquet", index=False)
     movies_test.to_parquet(OUT / "movies_test.parquet", index=False)
+    logger.info(f"  ✓ Saved to {OUT}/")
 
     logger.info("Saving mappings...")
     with open(OUT / "mappings.json", "w") as f:
@@ -315,31 +281,37 @@ def main():
                 "book2id": book2id,
                 "movie2id": movie2id,
                 "split": {
-                    "type": "cold_start",
-                    "k_shot_train": k_shot_train,
+                    "type": "random_percent",
+                    "train_percent": train_percent,
+                    "seed": 42,
                     "min_user_interactions": 5,
                     "min_item_interactions": 5,
+                    "description": "Random 10% of target domain interactions per user for training, source domain fully in training"
                 },
             },
             f,
         )
+    logger.info(f"  ✓ Saved mappings.json")
 
-    all_movies = pd.concat([movies_train, movies_val, movies_test])
-    print(all_movies)
-    
-    # calculate sparsity and log
-    #calculate_sparsity(
-    #    books_train, 
-    #    all_movies, 
-    #    len(user2id), 
-    #    len(book2id), 
-    #    len(movie2id)
-    #)
-
-    logger.info("Done.")
-    logger.info(f"Users: {len(user2id)}, Books: {len(book2id)}, Movies: {len(movie2id)}")
-    logger.info(f"Movies split sizes - Train: {len(movies_train)}, Val: {len(movies_val)}, Test: {len(movies_test)}")
-    logger.info(f"Output saved to {OUT}")
+    # Final summary
+    logger.info("=" * 80)
+    logger.info("PREPROCESSING COMPLETED SUCCESSFULLY!")
+    logger.info("=" * 80)
+    logger.info(f"Dataset Statistics:")
+    logger.info(f"  Users: {len(user2id):,}")
+    logger.info(f"  Books: {len(book2id):,}")
+    logger.info(f"  Movies: {len(movie2id):,}")
+    logger.info(f"")
+    logger.info(f"Training Data:")
+    logger.info(f"  Books (source): {len(books_train):,} interactions (100% of filtered)")
+    logger.info(f"  Movies (target): {len(movies_train):,} interactions (~{train_percent:.0%} per user)")
+    logger.info(f"")
+    logger.info(f"Evaluation Data:")
+    logger.info(f"  Movies Val: {len(movies_val):,}")
+    logger.info(f"  Movies Test: {len(movies_test):,}")
+    logger.info(f"")
+    logger.info(f"Output location: {OUT}")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":

@@ -11,8 +11,8 @@ training:
 
 # Model configuration
 model:
-  hidden: 32
-  heads: 2
+  hidden: 64
+  heads: 4
 
 # Loss configuration
 loss:

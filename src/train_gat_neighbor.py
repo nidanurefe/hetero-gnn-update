@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -35,6 +36,11 @@ class HeteroGAT(nn.Module):
         self.user_emb = nn.Embedding(num_users, hidden)
         self.book_emb = nn.Embedding(num_books, hidden)
         self.movie_emb = nn.Embedding(num_movies, hidden)
+        
+        # Initialize embeddings with Xavier uniform (better than default)
+        nn.init.xavier_uniform_(self.user_emb.weight)
+        nn.init.xavier_uniform_(self.book_emb.weight)
+        nn.init.xavier_uniform_(self.movie_emb.weight)
 
         # First layer
         convs1 = {
@@ -89,6 +95,14 @@ def link_bce_loss(z_user: torch.Tensor, z_item: torch.Tensor,
     dst = edge_label_index[1]
     scores = (z_user[src] * z_item[dst]).sum(dim=-1)
     return F.binary_cross_entropy_with_logits(scores, edge_label.float())
+
+def weighted_bce_loss(z_user, z_item, edge_label_index, edge_label, pos_weight: float):
+    src = edge_label_index[0]
+    dst = edge_label_index[1]
+    scores = (z_user[src] * z_item[dst]).sum(dim=-1)
+
+    pw = torch.tensor([pos_weight], device=scores.device, dtype=scores.dtype)
+    return F.binary_cross_entropy_with_logits(scores, edge_label.float(), pos_weight=pw)
 
 
 def make_link_loader(
@@ -171,6 +185,13 @@ def main():
     if use_books_loss and not use_books:
         logger.warning("use_books_loss=1 ama graph'ta book edge yok -> otomatik kapatıldı.")
 
+    # Check if movie training data is empty (k_shot_train=0 case)
+    use_movies = movie_edge_index.size(1) > 0
+    if not use_movies:
+        logger.warning("movies_train.parquet is empty (k_shot_train=0). Movie training will be skipped.")
+        if not use_books:
+            raise RuntimeError("Both movie and book training data are empty. Cannot train model.")
+
     if use_books:
         books_df = pd.read_parquet(PROC / "books_train.parquet")
         book_edge_index = torch.from_numpy(
@@ -179,18 +200,20 @@ def main():
     else:
         book_edge_index = None
 
-
-    movie_loader = make_link_loader(
-        data=data,
-        rel=MOVIE_REL,
-        edge_index=movie_edge_index,
-        batch_size=batch_size,
-        num_neighbors=num_neighbors,
-        neg_ratio=neg_ratio,
-        shuffle=True,
-    )
+    movie_loader: Optional[LinkNeighborLoader] = None
+    if use_movies:
+        movie_loader = make_link_loader(
+            data=data,
+            rel=MOVIE_REL,
+            edge_index=movie_edge_index,
+            batch_size=batch_size,
+            num_neighbors=num_neighbors,
+            neg_ratio=neg_ratio,
+            shuffle=True,
+        )
 
     book_loader: Optional[LinkNeighborLoader] = None
+    book_iter = None
     if use_books:
         book_loader = make_link_loader(
             data=data,
@@ -209,49 +232,85 @@ def main():
 
     logger.info(
         f"Config: epochs={epochs}, batch_size={batch_size}, num_neighbors={num_neighbors}, "
-        f"neg_ratio={neg_ratio}, use_books={int(use_books)}, lambda_book={lambda_book}"
+        f"neg_ratio={neg_ratio}, use_movies={int(use_movies)}, use_books={int(use_books)}, lambda_book={lambda_book}"
     )
 
     data = data.to(device)  
+
+    # Loss tracking for plotting
+    epoch_losses = []
+    epoch_movie_losses = []
+    epoch_book_losses = []
 
     for ep in range(1, epochs + 1):
         model.train()
         total = total_movie = total_book = 0.0
         n_steps = 0
 
-        for mbatch in movie_loader:
-            mbatch = mbatch.to(device)
+        # Determine which loader to use as primary
+        if use_movies:
+            primary_loader = movie_loader
+        elif use_books:
+            primary_loader = book_loader
+        else:
+            raise RuntimeError("No training data available (both movies and books are empty)")
 
-            z = model(mbatch)
+        for primary_batch in primary_loader:
+            primary_batch = primary_batch.to(device)
+            z = model(primary_batch)
 
+            loss = torch.tensor(0.0, device=device)
+            loss_movie = torch.tensor(0.0, device=device)
+            loss_book = torch.tensor(0.0, device=device)
 
-            m_ei = mbatch[MOVIE_REL].edge_label_index
-            m_y  = mbatch[MOVIE_REL].edge_label
-            loss_movie = link_bce_loss(z["user"], z["movie"], m_ei, m_y)
+            # Movie loss
+            if use_movies:
+                m_ei = primary_batch[MOVIE_REL].edge_label_index
+                m_y  = primary_batch[MOVIE_REL].edge_label
+                loss_movie = weighted_bce_loss(
+                    z["user"], z["movie"], m_ei, m_y,
+                    pos_weight=neg_ratio 
+                )
+                loss = loss + loss_movie
 
-            loss = loss_movie
-
-
+            # Book loss
             if use_books:
-                try:
-                    bbatch = next(book_iter)
-                except StopIteration:
-                    book_iter = iter(book_loader)
-                    bbatch = next(book_iter)
-
-                bbatch = bbatch.to(device)
-                bz = model(bbatch)
+                if use_movies:
+                    # If using movies as primary, get book batch separately
+                    try:
+                        bbatch = next(book_iter)
+                    except StopIteration:
+                        book_iter = iter(book_loader)
+                        bbatch = next(book_iter)
+                    bbatch = bbatch.to(device)
+                    bz = model(bbatch)
+                else:
+                    # If using books as primary, use the current batch
+                    bbatch = primary_batch
+                    bz = z
 
                 b_ei = bbatch[BOOK_REL].edge_label_index
                 b_y  = bbatch[BOOK_REL].edge_label
-                loss_book = link_bce_loss(bz["user"], bz["book"], b_ei, b_y)
-
+            
+                loss_book = weighted_bce_loss(bz["user"], bz["book"], b_ei, b_y, pos_weight=neg_ratio )
                 loss = loss + lambda_book * loss_book
-            else:
-                loss_book = torch.tensor(0.0, device=device)
 
             opt.zero_grad()
             loss.backward()
+            
+            # Check gradients (debug)
+            if ep == 1 and n_steps == 0:
+                total_grad_norm = 0.0
+                param_count = 0
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        param_grad_norm = param.grad.data.norm(2)
+                        total_grad_norm += param_grad_norm.item() ** 2
+                        param_count += 1
+                total_grad_norm = total_grad_norm ** (1. / 2)
+                logger.info(f"  [Debug] Gradient norm: {total_grad_norm:.6f}, Parameters with grad: {param_count}")
+                logger.info(f"  [Debug] Loss values - total: {loss.item():.6f}, book: {loss_book.item():.6f}, movie: {loss_movie.item():.6f}")
+            
             opt.step()
 
             total += float(loss.item())
@@ -259,14 +318,46 @@ def main():
             total_book += float(loss_book.item())
             n_steps += 1
 
+        # Logging
+        avg_loss = total/max(n_steps,1)
+        avg_movie_loss = total_movie/max(n_steps,1)
+        avg_book_loss = total_book/max(n_steps,1)
+        
+        epoch_losses.append(avg_loss)
+        epoch_movie_losses.append(avg_movie_loss)
+        epoch_book_losses.append(avg_book_loss)
+        
+        log_parts = [f"[Epoch {ep:03d}] loss={avg_loss:.4f}"]
+        if use_movies:
+            log_parts.append(f"movie={avg_movie_loss:.4f}")
         if use_books:
-            logger.info(
-                f"[Epoch {ep:03d}] loss={total/max(n_steps,1):.4f} | movie={total_movie/max(n_steps,1):.4f} | book={total_book/max(n_steps,1):.4f}"
-            )
-        else:
-            logger.info(
-                f"[Epoch {ep:03d}] loss={total/max(n_steps,1):.4f} | movie={total_movie/max(n_steps,1):.4f}"
-            )
+            log_parts.append(f"book={avg_book_loss:.4f}")
+        logger.info(" | ".join(log_parts))
+
+    # Plot training loss curves
+    logger.info("Creating loss plot...")
+    plt.figure(figsize=(10, 6))
+    
+    epochs_range = range(1, epochs + 1)
+    plt.plot(epochs_range, epoch_losses, 'b-', label='Total Loss', linewidth=2)
+    
+    if use_movies:
+        plt.plot(epochs_range, epoch_movie_losses, 'r--', label='Movie Loss', linewidth=1.5)
+    if use_books:
+        plt.plot(epochs_range, epoch_book_losses, 'g--', label='Book Loss', linewidth=1.5)
+    
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training Loss Over Epochs', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Save plot
+    plot_path = save_path.replace('.pt', '_loss_plot.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    logger.info(f"Loss plot saved to: {plot_path}")
+    plt.close()
 
     logger.info(f"Saving model to: {save_path}")
     torch.save(model.state_dict(), save_path)

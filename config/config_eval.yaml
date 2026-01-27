@@ -1,16 +1,18 @@
 data:
   proc_dir: "data/processed"
-  graph_path: "data/processed/hetero_graph.pt"          # cross-domain eval 
-  # graph_path: "data/processed/hetero_graph_target_only.pt"  # target-only eval 
+  # graph_path: "data/processed/hetero_graph.pt"          # cross-domain eval 
+  graph_path: "data/processed/hetero_graph.pt"  # target-only eval 
 
 model:
   name: "gat"                                          # "gat" | "sage"
   ckpt_path: "data/processed/models/gat.pt"               
-  #ckpt_path: "data/processed/models/sage.pt"
+  #ckpt_path: "data/processed/models/gat.pt"
   hidden: 32
-  heads: 2                                              # for GAT only, ignored if model is "sage"
+  heads: 2                                             # for GAT only, ignored if model is "sage"
 
 eval:
   ks: [5, 10]
   num_neg: 99
   seed: 42
+
+  

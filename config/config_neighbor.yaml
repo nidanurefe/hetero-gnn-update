@@ -1,14 +1,15 @@
 
 # Training configuration for neighbor sampling
 training:
-  graph_path: data/processed/hetero_graph.pt
+  graph_path: data/processed/hetero_graph.pt  # Use target-only graph for training
   save_path: data/processed/models
   epochs: 20
   batch_size: 2048
   lr: 0.001
   weight_decay: 0.00001
-  num_neighbors: [80, 40] 
-  neg_ratio: 4.0  # negatives per positive
+  num_neighbors: [5, 3] 
+  neg_ratio: 5.0  # negatives per positive
+
 
 # Model configuration
 model:
