@@ -1,19 +1,16 @@
 # Export configuration for full-graph node embeddings
-data:
-  proc_dir: "data/processed"
-  graph_path: "data/processed/hetero_graph.pt"  # cross-domain graph
-  # graph_path: "data/processed/hetero_graph_target_only.pt"  # target-only graph
+# Data is now loaded automatically via HeteroDataLoader from data/raw/
 
 model:
-  name: "sage"                                  # "gat" | "sage"
-  ckpt_path: "/Users/nidac/Desktop/hetero-gnn-update/1-shot-update/models/sage-wbce-100ep-4neg-up.pt"
-  hidden: 32                                    # should match training (or will be inferred for SAGE/GAT embeddings)
+  name: "gat"                                  # "gat" | "sage"
+  ckpt_path: "data/processed/models/gat.pt"     # Path to trained model checkpoint
+  hidden: 32                                    # should match training (or will be inferred)
   heads: 2                                      # for GAT only
 
 export:
   out_dir: "data/processed/embeddings"
-  outfile: "sage-wbce-100ep-4neg-1shot.pt"
+  outfile: "gat_updated_embeddings.pt"                  # Output filename
   device: "cpu"
-  use_checkpoint_sizes: 0
+  use_checkpoint_sizes: 0                       # Use checkpoint sizes if mismatch occurs
 
 

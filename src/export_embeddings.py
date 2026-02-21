@@ -1,16 +1,26 @@
 from __future__ import annotations
-
+import torch_sparse, torch_scatter
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict
 
 import torch
 import yaml
 
-from logging_config import get_logger, setup_logging
+try:
+    from data_loader import HeteroDataLoader
+except ImportError:
+    from src.data_loader import HeteroDataLoader
 
-logger = get_logger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+RAW = Path("data/raw")
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -19,7 +29,6 @@ def load_yaml(path: str) -> Dict[str, Any]:
 
 
 def infer_hidden_from_state_dict(state: Dict[str, torch.Tensor]) -> int | None:
-    # Works for both HeteroGAT and HeteroSAGE in this repo: they all have user_emb.weight.
     w = state.get("user_emb.weight")
     if isinstance(w, torch.Tensor) and w.ndim == 2:
         return int(w.shape[1])
@@ -53,12 +62,7 @@ def main():
     parser.add_argument("--config", type=str, default="config/config_export.yaml")
     args = parser.parse_args()
 
-    setup_logging()
-
     cfg = load_yaml(args.config)
-    proc_dir = Path(cfg["data"]["proc_dir"])
-    graph_path = Path(cfg["data"]["graph_path"])
-
     model_name = cfg["model"]["name"]
     ckpt_path = Path(cfg["model"]["ckpt_path"])
     out_dir = Path(cfg["export"]["out_dir"])
@@ -69,19 +73,29 @@ def main():
     outfile = cfg["export"].get("outfile", f"{model_name.lower()}_embeddings.pt")
     out_path = out_dir / outfile
 
-    logger.info(f"Loading graph: {graph_path}")
-    data = torch.load(graph_path, weights_only=False).to(device)
+    logger.info("="*80)
+    logger.info("EXPORTING EMBEDDINGS FROM TRAINED MODEL")
+    logger.info("="*80)
 
-    logger.info(f"Loading mappings: {proc_dir / 'mappings.json'}")
-    with open(proc_dir / "mappings.json") as f:
-        mp = json.load(f)
+    # Load data using HeteroDataLoader
+    logger.info("\n Loading data with HeteroDataLoader...")
+    data_loader = HeteroDataLoader(raw_dir=RAW)
+    train_data, val_data, test_data, metadata = data_loader.load_data()
 
-    num_users_map = int(mp["num_users"])
-    num_books_map = int(mp["num_books"])
-    num_movies_map = int(mp["num_movies"])
+    # Use train_data for full graph embeddings
+    data = train_data.to(device)
 
-    logger.info(f"Loading checkpoint: {ckpt_path}")
-    state = torch.load(ckpt_path, map_location=device)
+    num_users_map = metadata["num_users"]
+    num_books_map = metadata["num_books"]
+    num_movies_map = metadata["num_movies"]
+
+    logger.info(f"\n Dataset info:")
+    logger.info(f"  Users:  {num_users_map:,}")
+    logger.info(f"  Books:  {num_books_map:,}")
+    logger.info(f"  Movies: {num_movies_map:,}")
+
+    logger.info(f"\n Loading checkpoint: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if not isinstance(state, dict):
         raise TypeError(f"Expected checkpoint to be a state_dict (dict). Got: {type(state)}")
 
@@ -112,7 +126,7 @@ def main():
     else:
         num_users, num_books, num_movies = num_users_map, num_books_map, num_movies_map
 
-    logger.info(f"Instantiating model: {model_name} (hidden={hidden}, heads={heads})")
+    logger.info(f"\n Instantiating model: {model_name} (hidden={hidden}, heads={heads})")
     ModelCls = load_model_class(model_name)
     if model_name.lower() == "gat":
         model = ModelCls(num_users, num_books, num_movies, hidden=hidden, heads=heads).to(device)
@@ -133,15 +147,16 @@ def main():
         raise RuntimeError(msg) from e
 
     model.eval()
-    logger.info("Computing full-graph embeddings...")
+    logger.info("\n Computing full-graph embeddings...")
     with torch.no_grad():
         z = model(data)  # Dict[str, Tensor]
 
     z_cpu = {k: v.detach().cpu() for k, v in z.items()}
+    
+    logger.info("\n Saving embeddings...")
     torch.save(
         {
             "model": model_name.lower(),
-            "graph_path": str(graph_path),
             "ckpt_path": str(ckpt_path),
             "hidden": hidden,
             "num_nodes": {
@@ -150,13 +165,19 @@ def main():
                 "movie": num_movies,
             },
             "embeddings": z_cpu,
+            "metadata": {
+                "num_users": num_users,
+                "num_books": num_books,
+                "num_movies": num_movies,
+            },
         },
         out_path,
     )
 
-    logger.info(f"Saved embeddings to: {out_path}")
+    logger.info("\n" + "*"*80)
+    logger.info(f"Embeddings saved to: {out_path}")
     for k, v in z_cpu.items():
-        logger.info(f" - {k}: shape={tuple(v.shape)} dtype={v.dtype}")
+        logger.info(f"  {k}: shape={tuple(v.shape)} dtype={v.dtype}")
 
 
 if __name__ == "__main__":

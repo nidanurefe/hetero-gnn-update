@@ -1,34 +1,40 @@
 from __future__ import annotations
-
+import torch_sparse, torch_scatter
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import matplotlib.pyplot as plt
-import yaml
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import LinkNeighborLoader
 from torch_geometric.nn import HeteroConv, SAGEConv
 
-from logging_config import get_logger
+try:
+    from data_loader import HeteroDataLoader
+except ImportError:
+    from src.data_loader import HeteroDataLoader
 
-logger = get_logger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 PROC = Path("data/processed")
+RAW = Path("data/raw")
 
 MOVIE_REL = ("user", "rates_movie", "movie")
 BOOK_REL  = ("user", "rates_book", "book")
 
 
-# Model (2 layer HeteroSAGE)
 # Uses neighbor sampling
-# Batch[node_type].n_id => global node IDs in the subgraph
-# Select embeddings only for those nodes
 class HeteroSAGE(nn.Module):
     def __init__(self, num_users: int, num_books: int, num_movies: int, hidden: int = 64):
         super().__init__()
@@ -143,70 +149,80 @@ def get_edge_count(data: HeteroData, rel: Tuple[str, str, str]) -> int:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config/config_neighbor.yaml")
+    parser.add_argument("--config", type=str, default="config/config_neighbor.yaml", help="Path to config file")
     args_cmd = parser.parse_args()
 
     with open(args_cmd.config, "r") as f:
         config = yaml.safe_load(f)
 
-    graph_path    = config["training"]["graph_path"]
-    save_path     = config["training"]["save_path"] + "/sage.pt"
-    epochs        = config["training"]["epochs"]
-    batch_size    = config["training"]["batch_size"]
-    lr            = config["training"]["lr"]
-    weight_decay  = config["training"]["weight_decay"]
+    save_path = config["training"]["save_path"] + "/sage.pt"
+    epochs = config["training"]["epochs"]
+    batch_size = config["training"]["batch_size"]
+    lr = config["training"]["lr"]
+    weight_decay = config["training"]["weight_decay"]
     num_neighbors = config["training"]["num_neighbors"]
-    neg_ratio     = config["training"]["neg_ratio"]
-
-    hidden        = config["model"]["hidden"]
-
+    neg_ratio = config["training"]["neg_ratio"]
+    
+    hidden = config["model"]["hidden"]
+    
     use_books_loss = config["loss"]["use_books_loss"]
-    lambda_book    = config["loss"]["lambda_book"]
+    lambda_book = config["loss"]["lambda_book"]
 
-    logger.info("Starting SAGE training (neighbor sampling)...")
+    logger.info("="*80)
+    logger.info("Starting SAGE training with HeteroDataLoader...")
+    logger.info("="*80)
     device = torch.device("cpu")
     logger.info(f"Device: {device}")
 
-    logger.info(f"Loading graph: {graph_path}")
-    data: HeteroData = torch.load(graph_path, weights_only=False)
+    # Load data using HeteroDataLoader
+    logger.info("\n Loading data with HeteroDataLoader...")
+    data_loader = HeteroDataLoader(raw_dir=RAW)
+    train_data, val_data, test_data, metadata = data_loader.load_data()
 
-    with open(PROC / "mappings.json") as f:
-        mp = json.load(f)
+    num_users = metadata["num_users"]
+    num_books = metadata["num_books"]
+    num_movies = metadata["num_movies"]
 
-    num_users  = mp["num_users"]
-    num_books  = mp["num_books"]
-    num_movies = mp["num_movies"]
+    logger.info(f"\nDataset loaded:")
+    logger.info(f"  Users:  {num_users:,}")
+    logger.info(f"  Books:  {num_books:,}")
+    logger.info(f"  Movies: {num_movies:,}")
+    logger.info(f"  Train edges - Movies: {metadata['train_stats']['num_movie_edges']:,}, Books: {metadata['train_stats']['num_book_edges']:,}")
 
+    # Use train_data as the main graph
+    data = train_data
+    
     e_movie = get_edge_count(data, MOVIE_REL)
     e_book  = get_edge_count(data, BOOK_REL)
-    logger.info(f"Graph sizes - Users={num_users} Books={num_books} Movies={num_movies}")
-    logger.info(f"Edge counts - movie={e_movie} book={e_book}")
 
-    # edge list from parquet (fast conversion)
-    movies_df = pd.read_parquet(PROC / "movies_train.parquet")
-    movie_edge_index = torch.from_numpy(movies_df[["uid", "iid"]].to_numpy().T).long()
+    # Get edge indices for training
+    movie_edge_index = data[MOVIE_REL].edge_index
+    book_edge_index = data[BOOK_REL].edge_index if e_book > 0 else None
 
     use_books = bool(use_books_loss) and (e_book > 0)
     if use_books_loss and not use_books:
         logger.warning("use_books_loss=1 ama graph'ta book edge yok -> otomatik kapatıldı.")
 
-    if use_books:
-        books_df = pd.read_parquet(PROC / "books_train.parquet")
-        book_edge_index = torch.from_numpy(books_df[["uid", "iid"]].to_numpy().T).long()
-    else:
-        book_edge_index = None
+    use_movies = movie_edge_index.size(1) > 0
+    if not use_movies:
+        logger.warning("Movie edges empty. Movie training will be skipped.")
+        if not use_books:
+            raise RuntimeError("Both movie and book training data are empty. Cannot train model.")
 
-    movie_loader = make_link_loader(
-        data=data,
-        rel=MOVIE_REL,
-        edge_index=movie_edge_index,
-        batch_size=batch_size,
-        num_neighbors=num_neighbors,
-        neg_ratio=neg_ratio,
-        shuffle=True,
-    )
+    movie_loader: Optional[LinkNeighborLoader] = None
+    if use_movies:
+        movie_loader = make_link_loader(
+            data=data,
+            rel=MOVIE_REL,
+            edge_index=movie_edge_index,
+            batch_size=batch_size,
+            num_neighbors=num_neighbors,
+            neg_ratio=neg_ratio,
+            shuffle=True,
+        )
 
     book_loader: Optional[LinkNeighborLoader] = None
+    book_iter = None
     if use_books:
         book_loader = make_link_loader(
             data=data,
@@ -224,15 +240,11 @@ def main():
 
     logger.info(
         f"Config: epochs={epochs}, batch_size={batch_size}, num_neighbors={num_neighbors}, "
-        f"neg_ratio={neg_ratio}, use_books={int(use_books)}, lambda_book={lambda_book}, hidden={hidden}"
+        f"neg_ratio={neg_ratio}, use_movies={int(use_movies)}, use_books={int(use_books)}, lambda_book={lambda_book}"
     )
-    
-    data = data.to(device)
-    
-    # Calculate pos_weight for weighted BCE
-    pos_weight = neg_ratio + 1.0  # total_samples / positive_samples
-    logger.info(f"Using pos_weight={pos_weight:.2f} for weighted BCE loss")
-    
+
+    data = data.to(device)  
+
     # Loss tracking for plotting
     epoch_losses = []
     epoch_movie_losses = []
@@ -243,36 +255,72 @@ def main():
         total = total_movie = total_book = 0.0
         n_steps = 0
 
-        for mbatch in movie_loader:
-            mbatch = mbatch.to(device)
-            z = model(mbatch)
+        # Determine which loader to use as primary
+        if use_movies:
+            primary_loader = movie_loader
+        elif use_books:
+            primary_loader = book_loader
+        else:
+            raise RuntimeError("No training data available (both movies and books are empty)")
 
-            m_ei = mbatch[MOVIE_REL].edge_label_index
-            m_y  = mbatch[MOVIE_REL].edge_label
-            loss_movie = weighted_bce_loss(z["user"], z["movie"], m_ei, m_y, pos_weight)
+        for primary_batch in primary_loader:
+            primary_batch = primary_batch.to(device)
+            z = model(primary_batch)
 
-            loss = loss_movie
+            loss = torch.tensor(0.0, device=device)
+            loss_movie = torch.tensor(0.0, device=device)
+            loss_book = torch.tensor(0.0, device=device)
 
+            # Movie loss
+            if use_movies:
+                m_ei = primary_batch[MOVIE_REL].edge_label_index
+                m_y  = primary_batch[MOVIE_REL].edge_label
+                # loss_movie = weighted_bce_loss(
+                #     z["user"], z["movie"], m_ei, m_y,
+                #     pos_weight=neg_ratio 
+                # )
+                loss_movie = link_bce_loss(z["user"], z["movie"], m_ei, m_y)
+                loss = loss + loss_movie
+
+            # Book loss
             if use_books:
-                try:
-                    bbatch = next(book_iter)
-                except StopIteration:
-                    book_iter = iter(book_loader)
-                    bbatch = next(book_iter)
-
-                bbatch = bbatch.to(device)
-                bz = model(bbatch)
+                if use_movies:
+                    # If using movies as primary, get book batch separately
+                    try:
+                        bbatch = next(book_iter)
+                    except StopIteration:
+                        book_iter = iter(book_loader)
+                        bbatch = next(book_iter)
+                    bbatch = bbatch.to(device)
+                    bz = model(bbatch)
+                else:
+                    # If using books as primary, use the current batch
+                    bbatch = primary_batch
+                    bz = z
 
                 b_ei = bbatch[BOOK_REL].edge_label_index
                 b_y  = bbatch[BOOK_REL].edge_label
-                loss_book = weighted_bce_loss(bz["user"], bz["book"], b_ei, b_y, pos_weight)
-
+            
+                # loss_book = weighted_bce_loss(bz["user"], bz["book"], b_ei, b_y, pos_weight=neg_ratio )
+                loss_book = link_bce_loss(bz["user"], bz["book"], b_ei, b_y)
                 loss = loss + lambda_book * loss_book
-            else:
-                loss_book = torch.tensor(0.0, device=device)
 
             opt.zero_grad()
             loss.backward()
+            
+            # Check gradients (debug)
+            if ep == 1 and n_steps == 0:
+                total_grad_norm = 0.0
+                param_count = 0
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        param_grad_norm = param.grad.data.norm(2)
+                        total_grad_norm += param_grad_norm.item() ** 2
+                        param_count += 1
+                total_grad_norm = total_grad_norm ** (1. / 2)
+                logger.info(f"  [Debug] Gradient norm: {total_grad_norm:.6f}, Parameters with grad: {param_count}")
+                logger.info(f"  [Debug] Loss values - total: {loss.item():.6f}, book: {loss_book.item():.6f}, movie: {loss_movie.item():.6f}")
+            
             opt.step()
 
             total += float(loss.item())
@@ -290,11 +338,10 @@ def main():
         epoch_book_losses.append(avg_book_loss)
         
         log_parts = [f"[Epoch {ep:03d}] loss={avg_loss:.4f}"]
+        if use_movies:
+            log_parts.append(f"movie={avg_movie_loss:.4f}")
         if use_books:
-            log_parts.append(f"movie={avg_movie_loss:.4f}")
             log_parts.append(f"book={avg_book_loss:.4f}")
-        else:
-            log_parts.append(f"movie={avg_movie_loss:.4f}")
         logger.info(" | ".join(log_parts))
 
     # Plot training loss curves
@@ -303,8 +350,9 @@ def main():
     
     epochs_range = range(1, epochs + 1)
     plt.plot(epochs_range, epoch_losses, 'b-', label='Total Loss', linewidth=2)
-    plt.plot(epochs_range, epoch_movie_losses, 'r--', label='Movie Loss', linewidth=1.5)
     
+    if use_movies:
+        plt.plot(epochs_range, epoch_movie_losses, 'r--', label='Movie Loss', linewidth=1.5)
     if use_books:
         plt.plot(epochs_range, epoch_book_losses, 'g--', label='Book Loss', linewidth=1.5)
     
@@ -323,7 +371,7 @@ def main():
 
     logger.info(f"Saving model to: {save_path}")
     torch.save(model.state_dict(), save_path)
-    logger.info("✓ Saved")
+    logger.info(" Saved")
 
 
 if __name__ == "__main__":

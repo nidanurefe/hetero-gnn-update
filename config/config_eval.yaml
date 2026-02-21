@@ -5,8 +5,8 @@ data:
 
 model:
   name: "gat"                                          # "gat" | "sage"
-  ckpt_path: "data/processed/models/gat.pt"               
-  #ckpt_path: "data/processed/models/gat.pt"
+  # ckpt_path: "data/processed/models/sage.pt"               
+  ckpt_path: "data/processed/models/gat.pt"
   hidden: 32
   heads: 2                                             # for GAT only, ignored if model is "sage"
 

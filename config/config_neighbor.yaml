@@ -20,4 +20,3 @@ model:
 loss:
   use_books_loss: 1  # 1: use both domains, 0: movie-only
   lambda_book: 0.3
-

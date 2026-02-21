@@ -9,7 +9,13 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
-from logging_config import get_logger
+
+try:
+    from logging_config import get_logger
+    from data_loader import HeteroDataLoader, read_inter
+except ImportError:
+    from src.logging_config import get_logger
+    from src.data_loader import HeteroDataLoader, read_inter
 
 logger = get_logger(__name__)
 
@@ -55,11 +61,19 @@ def normalize_model_name(model_name: str) -> str:
 def load_model_class(model_name: str):
     name = model_name.strip().lower()
     if name == "gat":
-        from train_gat_neighbor import HeteroGAT  # type: ignore
-        return HeteroGAT
+        try:
+            from train_gat_neighbor import HeteroGAT  # type: ignore
+            return HeteroGAT
+        except ImportError:
+            from src.train_gat_neighbor import HeteroGAT  # type: ignore
+            return HeteroGAT
     if name == "sage":
-        from train_sage_neighbor import HeteroSAGE  # type: ignore
-        return HeteroSAGE
+        try:
+            from train_sage_neighbor import HeteroSAGE  # type: ignore
+            return HeteroSAGE
+        except ImportError:
+            from src.train_sage_neighbor import HeteroSAGE  # type: ignore
+            return HeteroSAGE
 
     raise ValueError(f"Unknown model.name='{model_name}'. Expected one of: gat | sage")
 
@@ -73,7 +87,6 @@ def main():
     cfg = load_config(args.config)
 
     proc_dir = Path(cfg["data"]["proc_dir"])
-    graph_path = Path(cfg["data"]["graph_path"])
 
     # Use command line argument if provided, otherwise use config
     model_name_cli = args.model if args.model is not None else cfg["model"]["name"]
@@ -96,16 +109,22 @@ def main():
 
     device = torch.device("cpu")
 
-    logger.info("Loading graph...")
-    data = torch.load(graph_path, weights_only=False).to(device)
+    # Load data using HeteroDataLoader
+    logger.info("Loading data with HeteroDataLoader...")
+    raw_dir = Path("data/raw")
+    data_loader = HeteroDataLoader(raw_dir=raw_dir)
+    train_data, val_data, test_data, metadata = data_loader.load_data()
+    
+    # Use train_data as the graph for embedding generation
+    data = train_data.to(device)
 
-    logger.info("Loading mappings...")
-    with open(proc_dir / "mappings.json") as f:
-        mp = json.load(f)
-
-    num_users = mp["num_users"]
-    num_books = mp["num_books"]
-    num_movies = mp["num_movies"]
+    num_users = metadata["num_users"]
+    num_books = metadata["num_books"]
+    num_movies = metadata["num_movies"]
+    
+    # Get mappings
+    user2idx = metadata["user2idx"]
+    movie2idx = metadata["movie2idx"]
 
     # instantiate model
     logger.info(f"Loading model class: {model_name} (from CLI: {model_name_cli})")
@@ -123,22 +142,50 @@ def main():
     model.load_state_dict(state)
     model.eval()
 
-    logger.info("Loading splits...")
-    train_df = pd.read_parquet(proc_dir / "movies_train.parquet")
-    val_df = pd.read_parquet(proc_dir / "movies_val.parquet")
-    test_df = pd.read_parquet(proc_dir / "movies_test.parquet")
+    logger.info("Loading and processing splits...")
+    # Load raw inter files
+    movies_train_raw = read_inter(raw_dir / "AmazonMovies.train.inter")
+    movies_valid_raw = read_inter(raw_dir / "AmazonMovies.valid.inter")
+    movies_test_raw = read_inter(raw_dir / "AmazonMovies.test.inter")
+    
+    # Apply mappings to get indices
+    def apply_mapping(df, user_map, item_map):
+        df = df.copy()
+        # Filter to only include known entities
+        df = df[df["user_id"].isin(user_map) & df["item_id"].isin(item_map)]
+        df["uid"] = df["user_id"].map(user_map)
+        df["iid"] = df["item_id"].map(item_map)
+        return df[["uid", "iid"]]
+    
+    train_df = apply_mapping(movies_train_raw, user2idx, movie2idx)
+    val_df = apply_mapping(movies_valid_raw, user2idx, movie2idx)
+    test_df = apply_mapping(movies_test_raw, user2idx, movie2idx)
+    
+    logger.info(f"  Train: {len(train_df):,} edges")
+    logger.info(f"  Val:   {len(val_df):,} edges")
+    logger.info(f"  Test:  {len(test_df):,} edges")
+    
+    train_edges = set(zip(train_df["uid"], train_df["iid"]))
+    test_edges = set(zip(test_df["uid"], test_df["iid"]))
+    overlap = train_edges & test_edges
+    if overlap:
+        logger.warning(f"⚠️  WARNING: {len(overlap)} train-test edges overlap! This causes data leakage.")
+    else:
+        logger.info(" No train-test overlap detected")
 
-    # user -> seen movie set (train + val + test) to avoid sampling seen items as negatives
     seen: Dict[int, set] = {}
-    for df in (train_df, val_df, test_df):
+    for df in (train_df, val_df):
         for u, g in df.groupby("uid"):
             seen.setdefault(int(u), set()).update(map(int, g["iid"]))
 
     test_by_user = test_df.groupby("uid")["iid"].apply(list).to_dict()
+    
+    logger.info(f"  Test users: {len(test_by_user):,}")
+    logger.info(f"  Avg items per test user: {np.mean([len(v) for v in test_by_user.values()]):.2f}")
 
     logger.info("Computing embeddings...")
     with torch.no_grad():
-        z = model(data)  # returns dict: {"user": [U,H], "movie":[M,H], ...}
+        z = model(data) 
         ZU = z["user"]
         ZM = z["movie"]
 
@@ -149,6 +196,7 @@ def main():
           {"MRR": []} 
 
     logger.info("Evaluating...")
+    n_users_evaluated = 0
     for u, pos_items in test_by_user.items():
         if not pos_items:
             continue
@@ -157,12 +205,19 @@ def main():
         pos_item = int(rng.choice(pos_items))
         pos_items = [pos_item]
 
-        # sample negatives
+        # sample negatives 
+        user_seen = seen.get(int(u), set())
         negs = []
-        while len(negs) < num_neg:
+        attempts = 0
+        max_attempts = num_neg * 100  # Avoid infinite loop
+        while len(negs) < num_neg and attempts < max_attempts:
             cand = int(rng.integers(0, num_movies))
-            if cand not in seen.get(int(u), set()):
+            if cand not in user_seen and cand != pos_item:
                 negs.append(cand)
+            attempts += 1
+        
+        if len(negs) < num_neg:
+            logger.warning(f"User {u}: Only found {len(negs)}/{num_neg} negatives after {attempts} attempts")
 
         candidates = pos_items + negs
 
@@ -183,9 +238,12 @@ def main():
             metrics[f"Recall@{k}"].append(recall_at_k(ranks, k))
             metrics[f"NDCG@{k}"].append(ndcg_at_k(ranks, k))
             metrics[f"HR@{k}"].append(get_hr(ranks, k))
-        metrics["MRR"].append(get_rr(ranks)) 
+        metrics["MRR"].append(get_rr(ranks))
+        n_users_evaluated += 1
+    
+    logger.info(f"Evaluated {n_users_evaluated} users") 
 
-    logger.info("\n=== Evaluation Results ===")
+    logger.info("\nEvaluation Results: ")
     for k in ks:
         logger.info(f"Recall@{k}: {np.mean(metrics[f'Recall@{k}']):.4f}")
         logger.info(f"NDCG@{k}:   {np.mean(metrics[f'NDCG@{k}']):.4f}")
