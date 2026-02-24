@@ -1,0 +1,56 @@
+training:
+  graph_path: data/processed/hetero_graph.pt
+  save_path: data/processed/models/optuna_quick
+  epochs: 20
+  batch_size: 2048
+
+optuna:
+  n_trials: 20 
+  timeout: null
+  
+  search_space:
+    lr:
+      type: loguniform
+      low: 0.0005
+      high: 0.005
+    
+    weight_decay:
+      type: loguniform
+      low: 0.00001
+      high: 0.0005
+    
+    neg_ratio:
+      type: categorical
+      choices: [2.0, 4.0, 6.0] 
+    
+    hidden:
+      type: categorical
+      choices: [32, 64] 
+    
+    heads:
+      type: categorical
+      choices: [2, 4]
+    
+    num_neighbors_1:
+      type: categorical
+      choices: [5, 10] 
+    
+    num_neighbors_2:
+      type: categorical
+      choices: [3, 5]
+    
+    lambda_book:
+      type: uniform
+      low: 0.2
+      high: 0.4
+
+loss:
+  use_books_loss: 1
+
+evaluation:
+  metric: loss  
+  k_values: [5, 10]
+
+pruning:
+  enabled: true
+  patience: 3 

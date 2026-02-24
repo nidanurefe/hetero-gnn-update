@@ -1,0 +1,68 @@
+training:
+  graph_path: data/processed/hetero_graph.pt
+  save_path: data/processed/models/optuna_best
+  epochs: 20  # Fixed for optimization 
+  batch_size: 2048
+
+optuna:
+  n_trials: 50  # Number of trials to run
+  timeout: null  # Time limit in seconds
+  
+  # Search space for hyperparameters
+  search_space:
+    # Learning rate: log-uniform between 1e-4 and 1e-2
+    lr:
+      type: loguniform
+      low: 0.0001
+      high: 0.01
+    
+    # Weight decay: log-uniform between 1e-6 and 1e-3
+    weight_decay:
+      type: loguniform
+      low: 0.000001
+      high: 0.001
+    
+    # Negative sampling ratio: choices
+    neg_ratio:
+      type: categorical
+      choices: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    
+    # Hidden dimension: choices
+    hidden:
+      type: categorical
+      choices: [32, 64, 128]
+    
+    # Number of attention heads: choices
+    heads:
+      type: categorical
+      choices: [2, 4, 8]
+    
+    # Neighbor sampling (first layer): categorical
+    num_neighbors_1:
+      type: categorical
+      choices: [5, 10, 15, 20]
+    
+    # Neighbor sampling (second layer): categorical
+    num_neighbors_2:
+      type: categorical
+      choices: [3, 5, 8, 10]
+    
+    # Lambda for book loss weighting
+    lambda_book:
+      type: uniform
+      low: 0.1
+      high: 0.5
+
+# Loss configuration
+loss:
+  use_books_loss: 1  # 1: use both domains, 0: movie-only
+
+# Evaluation configuration
+evaluation:
+  metric: recall@10  # Metric to optimize: recall@10, recall@20, ndcg@10, or loss
+  k_values: [5, 10, 20]  # K values for evaluation metrics
+
+# Pruning configuration (optional)
+pruning:
+  enabled: true
+  patience: 5  # Stop trial if no improvement after N epochs
