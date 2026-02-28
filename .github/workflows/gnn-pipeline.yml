@@ -1,0 +1,529 @@
+name: GNN Training & Evaluation Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_domain:
+        description: 'Source domain '
+        required: true
+        default: 'AmazonBooks'
+        type: choice
+        options:
+          - AmazonBooks
+          - AmazonMovies
+      target_domain:
+        description: 'Target domain'
+        required: true
+        default: 'AmazonMovies'
+        type: choice
+        options:
+          - AmazonMovies
+          - AmazonBooks
+      model_type:
+        description: 'Model type'
+        required: true
+        default: 'gat'
+        type: choice
+        options:
+          - gat
+          - sage
+      epochs:
+        description: 'Epoch count'
+        required: true
+        default: '30'
+        type: string
+      batch_size:
+        description: 'Batch size'
+        required: true
+        default: '4096'
+        type: string
+      learning_rate:
+        description: 'Learning rate'
+        required: false
+        default: '0.002'
+        type: string
+      hidden_dim:
+        description: 'Hidden dimension'
+        required: false
+        default: '64'
+        type: string
+      neg_ratio:
+        description: 'Negative sample ratio'
+        required: false
+        default: '2.0'
+        type: string
+      experiment_name:
+        description: 'Experiment name (ID)'
+        required: true
+        type: string
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'config/pipeline_trigger.json'  # Trigger push only when this file is updated
+
+env:
+  REMOTE_HOST: ${{ secrets.REMOTE_HOST }}
+  REMOTE_USER: ${{ secrets.REMOTE_USER }}
+  REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+jobs:
+  train-gnn:
+    name: "🚀 GNN Training on Remote Server"
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.set-artifact-id.outputs.artifact_id }}
+      run_id: ${{ github.run_id }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.REMOTE_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Generate unique artifact ID
+        id: set-artifact-id
+        run: |
+          ARTIFACT_ID="${{ inputs.experiment_name }}-${{ github.run_id }}-$(date +%Y%m%d_%H%M%S)"
+          echo "artifact_id=$ARTIFACT_ID" >> $GITHUB_OUTPUT
+          echo "📦 Artifact ID: $ARTIFACT_ID"
+
+      - name: Clone or update repository on remote server
+        run: |
+          ssh ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }} << 'ENDSSH'
+          
+          # Define paths
+          PROJECT_DIR="${{ secrets.REMOTE_PATH }}"
+          REPO_URL="https://github.com/${{ github.repository }}.git"
+          BRANCH="${{ github.ref_name }}"
+          
+          echo "🔄 Setting up repository on remote server..."
+          echo "   Repository: $REPO_URL"
+          echo "   Branch: $BRANCH"
+          echo "   Target: $PROJECT_DIR"
+          
+          # Check if directory exists
+          if [ -d "$PROJECT_DIR/.git" ]; then
+            echo "📂 Repository exists, pulling latest changes..."
+            cd "$PROJECT_DIR"
+            git fetch origin
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH"
+          else
+            echo "📥 Cloning repository..."
+            mkdir -p "$(dirname $PROJECT_DIR)"
+            git clone --branch "$BRANCH" "$REPO_URL" "$PROJECT_DIR"
+          fi
+          
+          echo "✅ Repository ready!"
+          cd "$PROJECT_DIR"
+          git log -1 --oneline
+          ENDSSH
+
+      - name: Create training config on remote
+        run: |
+          ssh ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }} << 'ENDSSH'
+          cd ${{ secrets.REMOTE_PATH }}
+          
+          # Create dynamic config for this run
+          cat > config/config_pipeline.yaml << 'EOF'
+          # Auto-generated pipeline config
+          # Run ID: ${{ github.run_id }}
+          # Experiment: ${{ inputs.experiment_name }}
+          
+          data:
+            raw_dir: data/raw
+            source_domain: ${{ inputs.source_domain }}
+            target_domain: ${{ inputs.target_domain }}
+            # Source files: {source_domain}.train.inter
+            # Target files: {target_domain}.train.inter, {target_domain}.valid.inter, {target_domain}.test.inter
+          
+          training:
+            graph_path: data/processed/hetero_graph.pt
+            save_path: data/processed/models
+            epochs: ${{ inputs.epochs }}
+            batch_size: ${{ inputs.batch_size }}
+            lr: ${{ inputs.learning_rate }}
+            weight_decay: 0.0001
+            num_neighbors: [10,5]
+            neg_ratio: ${{ inputs.neg_ratio }}
+          
+          model:
+            name: ${{ inputs.model_type }}
+            hidden: ${{ inputs.hidden_dim }}
+            heads: 4
+          
+          loss:
+            use_books_loss: 1
+            lambda_book: 0.3
+          
+          export:
+            out_dir: data/processed/embeddings
+            outfile: "${{ inputs.experiment_name }}_embeddings.pt"
+            device: cuda
+          EOF
+          ENDSSH
+
+      - name: Run GNN training on remote server
+        run: |
+          ssh ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }} << 'ENDSSH'
+          cd ${{ secrets.REMOTE_PATH }}
+          
+          # Conda/virtualenv activation (adjust according to your server)
+          source ~/.bashrc
+          # conda activate gnn-env  # or
+          # source venv/bin/activate
+          
+          echo "🔧 Starting training with parameters:"
+          echo "  Model: ${{ inputs.model_type }}"
+          echo "  Epochs: ${{ inputs.epochs }}"
+          echo "  Batch Size: ${{ inputs.batch_size }}"
+          echo "  Learning Rate: ${{ inputs.learning_rate }}"
+          echo "  Hidden Dim: ${{ inputs.hidden_dim }}"
+          
+          # Start training
+          python src/train_${{ inputs.model_type }}_neighbor.py \
+            --config config/config_pipeline.yaml \
+            2>&1 | tee logs/training_${{ github.run_id }}.log
+          
+          # Rename checkpoint with experiment name
+          MODEL_NAME="${{ inputs.experiment_name }}_${{ inputs.model_type }}"
+          cp data/processed/models/best_model.pt data/processed/models/${MODEL_NAME}.pt
+          
+          echo "✅ Training completed!"
+          ENDSSH
+
+      - name: Export embeddings on remote server
+        run: |
+          ssh ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }} << 'ENDSSH'
+          cd ${{ secrets.REMOTE_PATH }}
+          source ~/.bashrc
+          
+          echo "📤 Exporting embeddings..."
+          
+          # Update export config with correct model checkpoint
+          cat > config/config_export_pipeline.yaml << 'EOF'
+          model:
+            name: ${{ inputs.model_type }}
+            ckpt_path: data/processed/models/${{ inputs.experiment_name }}_${{ inputs.model_type }}.pt
+            hidden: ${{ inputs.hidden_dim }}
+            heads: 4
+          
+          export:
+            out_dir: data/processed/embeddings
+            outfile: "${{ inputs.experiment_name }}_embeddings.pt"
+            device: cuda
+            use_checkpoint_sizes: false
+          EOF
+          
+          python src/export_embeddings.py --config config/config_export_pipeline.yaml
+          
+          echo "✅ Embeddings exported!"
+          ENDSSH
+
+      - name: Download artifacts from remote
+        run: |
+          mkdir -p artifacts
+          
+          # Download embeddings
+          scp ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }}:${{ secrets.REMOTE_PATH }}/data/processed/embeddings/${{ inputs.experiment_name }}_embeddings.pt artifacts/
+          
+          # Download model checkpoint
+          scp ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }}:${{ secrets.REMOTE_PATH }}/data/processed/models/${{ inputs.experiment_name }}_${{ inputs.model_type }}.pt artifacts/
+          
+          # Download training logs
+          scp ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }}:${{ secrets.REMOTE_PATH }}/logs/training_${{ github.run_id }}.log artifacts/
+          
+          # Save parameters to a JSON file 
+          cat > artifacts/params.json << EOF
+          {
+            "experiment_name": "${{ inputs.experiment_name }}",
+            "model_type": "${{ inputs.model_type }}",
+            "epochs": ${{ inputs.epochs }},
+            "batch_size": ${{ inputs.batch_size }},
+            "learning_rate": ${{ inputs.learning_rate }},
+            "hidden_dim": ${{ inputs.hidden_dim }},
+            "neg_ratio": ${{ inputs.neg_ratio }},
+            "source_domain": "${{ inputs.source_domain }}",
+            "target_domain": "${{ inputs.target_domain }}",
+            "run_id": "${{ github.run_id }}",
+            "artifact_id": "${{ steps.set-artifact-id.outputs.artifact_id }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Upload embeddings artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: embeddings-${{ steps.set-artifact-id.outputs.artifact_id }}
+          path: artifacts/${{ inputs.experiment_name }}_embeddings.pt
+          retention-days: 30
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-${{ steps.set-artifact-id.outputs.artifact_id }}
+          path: artifacts/${{ inputs.experiment_name }}_${{ inputs.model_type }}.pt
+          retention-days: 30
+
+      - name: Upload training logs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ steps.set-artifact-id.outputs.artifact_id }}
+          path: |
+            artifacts/training_${{ github.run_id }}.log
+            artifacts/params.json
+          retention-days: 30
+
+  run-diffusion:
+    name: "🔄 Run Diffusion Model"
+    runs-on: ubuntu-latest
+    needs: train-gnn
+    outputs:
+      diffusion_completed: ${{ steps.diffusion.outputs.completed }}
+    
+    steps:
+      - name: Checkout diffusion repository
+        uses: actions/checkout@v4
+        with:
+          repository: https://github.com/yahyayesilyurt/conditional-diffusion-cdr  
+          path: diffusion-code
+
+      - name: Download embeddings artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: embeddings-${{ needs.train-gnn.outputs.artifact_id }}
+          path: embeddings/
+
+      - name: Download model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: model-${{ needs.train-gnn.outputs.artifact_id }}
+          path: models/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install diffusion dependencies
+        run: |
+          cd diffusion-code
+          pip install -r requirements.txt
+          # Or manual installation:
+          # pip install torch torchvision numpy pandas scipy
+
+      - name: Prepare diffusion config
+        run: |
+          # Create config for diffusion training using GNN experiment parameters 
+          cat > diffusion-code/config/pipeline_config.yaml << EOF
+          # Auto-generated by GNN pipeline
+          experiment_name: ${{ inputs.experiment_name }}
+          artifact_id: ${{ needs.train-gnn.outputs.artifact_id }}
+          
+          embeddings:
+            path: ../embeddings/${{ inputs.experiment_name }}_embeddings.pt
+          
+          model:
+            checkpoint: ../models/${{ inputs.experiment_name }}_${{ inputs.model_type }}.pt
+            type: ${{ inputs.model_type }}
+            hidden_dim: ${{ inputs.hidden_dim }}
+          
+          training:
+            epochs: 100
+            batch_size: 256
+            learning_rate: 0.001
+          
+          output:
+            dir: ../diffusion_results
+            save_predictions: true
+          EOF
+
+      - name: Run diffusion training
+        id: diffusion
+        run: |
+          mkdir -p diffusion_results
+          cd diffusion-code
+          
+          echo "🔄 Starting diffusion model training..."
+          echo "   Using embeddings from: ${{ inputs.experiment_name }}"
+          
+          # Start diffusion training
+          python train.py --config config/pipeline_config.yaml 2>&1 | tee ../diffusion_results/diffusion_training.log
+          
+          echo "completed=true" >> $GITHUB_OUTPUT
+          echo "✅ Diffusion training completed!"
+
+      - name: Upload diffusion results
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-${{ needs.train-gnn.outputs.artifact_id }}
+          path: diffusion_results/
+          retention-days: 30
+
+  evaluate-ranking:
+    name: "📊 Ranking Evaluation"
+    runs-on: ubuntu-latest
+    needs: [train-gnn, run-diffusion]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install torch-geometric torch-sparse torch-scatter
+          pip install pandas numpy pyyaml openpyxl xlsxwriter
+
+      - name: Download embeddings artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: embeddings-${{ needs.train-gnn.outputs.artifact_id }}
+          path: data/processed/embeddings/
+
+      - name: Download model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: model-${{ needs.train-gnn.outputs.artifact_id }}
+          path: data/processed/models/
+
+      - name: Download logs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: logs-${{ needs.train-gnn.outputs.artifact_id }}
+          path: logs/
+
+      - name: Download diffusion results
+        uses: actions/download-artifact@v4
+        with:
+          name: diffusion-${{ needs.train-gnn.outputs.artifact_id }}
+          path: diffusion_results/
+
+      - name: Prepare evaluation config
+        run: |
+          cat > config/config_eval_pipeline.yaml << EOF
+          data:
+            proc_dir: data/processed
+          
+          model:
+            name: ${{ inputs.model_type }}
+            ckpt_path: data/processed/models/${{ inputs.experiment_name }}_${{ inputs.model_type }}.pt
+            hidden: ${{ inputs.hidden_dim }}
+            heads: 4
+          
+          diffusion:
+            results_dir: diffusion_results
+          
+          eval:
+            ks: [5, 10, 20]
+            num_neg: 99
+            seed: 42
+          EOF
+
+      - name: Run ranking evaluation
+        id: eval
+        run: |
+          python src/eval_rank.py --config config/config_eval_pipeline.yaml 2>&1 | tee evaluation_output.log
+          
+          # Parse results from log
+          echo "evaluation_log<<EOF" >> $GITHUB_OUTPUT
+          cat evaluation_output.log >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Parse diffusion results
+        run: |
+          # Extract relevant metrics from diffusion training log and append to evaluation log
+          if [ -f diffusion_results/diffusion_training.log ]; then
+            echo "\U0001F4CA Diffusion training metrics:" >> evaluation_output.log
+            grep -E "(loss|accuracy|epoch|metric)" diffusion_results/diffusion_training.log >> evaluation_output.log || true
+          fi
+
+      - name: Export results to Excel
+        run: |
+          python scripts/export_results_to_excel.py \
+            --params logs/params.json \
+            --eval-log evaluation_output.log \
+            --output results/experiment_results.xlsx \
+            --artifact-id ${{ needs.train-gnn.outputs.artifact_id }}
+
+      - name: Upload results Excel
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ needs.train-gnn.outputs.artifact_id }}
+          path: results/experiment_results.xlsx
+          retention-days: 90
+
+      - name: Create summary
+        run: |
+          echo "## 🎯 Experiment Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Parameters" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Experiment | ${{ inputs.experiment_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Model | ${{ inputs.model_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Epochs | ${{ inputs.epochs }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Batch Size | ${{ inputs.batch_size }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Learning Rate | ${{ inputs.learning_rate }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Hidden Dim | ${{ inputs.hidden_dim }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact ID | ${{ needs.train-gnn.outputs.artifact_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Diffusion | ✅ Completed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Evaluation Log" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat evaluation_output.log | tail -20 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  aggregate-results:
+    name: "📈 Aggregate to Master Excel"
+    runs-on: ubuntu-latest
+    needs: [train-gnn, run-diffusion, evaluate-ranking]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install pandas openpyxl
+
+      - name: Download current results
+        uses: actions/download-artifact@v4
+        with:
+          name: results-${{ needs.train-gnn.outputs.artifact_id }}
+          path: current_results/
+
+      - name: Aggregate results to master Excel
+        run: |
+          python scripts/aggregate_results.py \
+            --input current_results/experiment_results.xlsx \
+            --master results/all_experiments.xlsx
+
+      - name: Commit updated master Excel
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add results/all_experiments.xlsx
+          git diff --staged --quiet || git commit -m "📊 Add experiment results: ${{ inputs.experiment_name }} [skip ci]"
+          git push
